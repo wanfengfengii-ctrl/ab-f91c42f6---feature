@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -10,6 +10,27 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 from .alignment import align_joint
+
+
+class LossInterval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    min: int = Field(..., ge=0, le=3, description="残失环数下界（0–3）。")
+    max: int = Field(..., ge=0, le=3, description="残失环数上界（0–3）。")
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "LossInterval":
+        if self.min > self.max:
+            raise ValueError("残失环数区间倒置：min 不得大于 max")
+        return self
+
+
+class TerminalLoss(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # 启用 terminal_loss 时 A、B 两侧配置必须同时完整提供，缺失任一侧即 422。
+    a: LossInterval = Field(..., description="A 芯表层残失环数闭区间。")
+    b: LossInterval = Field(..., description="B 芯表层残失环数闭区间。")
 
 
 def _sanitize_errors(errors: list[dict]) -> list[dict]:
@@ -48,6 +69,10 @@ class AlignRequest(BaseModel):
     max_false_a: int = Field(..., ge=0, le=3, description="A 芯伪环限额 0–3。")
     max_missing_b: int = Field(..., ge=0, le=3, description="B 芯缺环限额 0–3。")
     max_false_b: int = Field(..., ge=0, le=3, description="B 芯伪环限额 0–3。")
+    terminal_loss: Optional[TerminalLoss] = Field(
+        None,
+        description="可选：A、B 两芯表层残失环数（0–3）闭区间；"
+                    "启用时两侧配置必须同时完整提供。")
 
     @field_validator("chronology")
     @classmethod

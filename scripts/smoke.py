@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """两芯联合对齐 API 冒烟脚本。
 
-覆盖四类响应：唯一解、歧义解、越界校验错误、无解（含两芯证据）。
+覆盖响应：唯一解、歧义解、越界校验错误、无解（含两芯证据），
+以及表层残失环 terminal_loss 的校准冒烟（含无该字段的兼容调用）。
 任一断言失败以非零退出码结束。
 """
 
@@ -53,6 +54,24 @@ def case_no_solution() -> dict:
     body = case_unique()
     body["sample_b"] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 99999]
     body["tolerance_b"] = [0] * 10
+    return body
+
+
+def case_loss_separated() -> dict:
+    # 两芯实际终年相差 1：A 终年 2009（与唯一解算例一致），
+    # B 取年表下标 9..18（终年 2008），容差 0 时终年集合不相交。
+    body = case_unique()
+    body["sample_b"] = [CHRON[i] for i in range(9, 19)]
+    body["tolerance_b"] = [0] * 10
+    body["terminal_loss"] = {"a": {"min": 0, "max": 1},
+                             "b": {"min": 1, "max": 1}}
+    return body
+
+
+def case_loss_no_felling() -> dict:
+    body = case_unique()
+    body["terminal_loss"] = {"a": {"min": 3, "max": 3},
+                             "b": {"min": 0, "max": 0}}
     return body
 
 
@@ -112,6 +131,61 @@ def main(base: str) -> int:
     assert "shared_end_details" in ev
     print("  [ok] 无解：原因 "
           f"{ev['reason']}，并给出两支树芯证据")
+
+    # 5) 兼容调用：不含 terminal_loss 的响应不出现 outer_loss 字段
+    code, r = post(base, "/api/dendro/align", case_unique())
+    assert code == 200, r
+    assert "outer_loss" not in r["mappings"]["a"], r
+    assert "outer_loss" not in r["witnesses"][0]["mappings"]["b"], r
+    print("  [ok] 兼容调用：无 terminal_loss 时响应形态不变")
+
+    # 6) 残失校准：A 终年 2009、B 终年 2008，B 固定残失 1、A 残失 0..1，
+    #    共同砍伐年 2009（A: 末环 2009+残失 0；B: 末环 2008+残失 1）。
+    code, r = post(base, "/api/dendro/align", case_loss_separated())
+    assert code == 200, r
+    assert r["status"] in ("unique", "ambiguous"), r
+    assert r["common_end_year"] == 2009, r
+    for w in r["witnesses"]:
+        for side in ("a", "b"):
+            mp = w["mappings"][side]
+            assert mp["end_year"] + mp["outer_loss"] == w["common_end_year"]
+            assert "outer_loss" in mp
+    ma, mb = r["mappings"]["a"], r["mappings"]["b"]
+    assert ma["end_year"] == 2009 and ma["outer_loss"] == 0, r
+    assert mb["end_year"] == 2008 and mb["outer_loss"] == 1, r
+    print(f"  [ok] 残失校准：共同砍伐年 {r['common_end_year']}，"
+          f"A 末环 {ma['end_year']}（残失 {ma['outer_loss']}），"
+          f"B 末环 {mb['end_year']}（残失 {mb['outer_loss']}）")
+
+    # 7) 残失无法形成共同砍伐年：no_solution 并列出双方推定年份
+    code, r = post(base, "/api/dendro/align", case_loss_no_felling())
+    assert code == 200, r
+    assert r["status"] == "no_solution", r
+    ev = r["evidence"]
+    assert ev["reason"] == "no_common_felling_year", ev
+    inferred_a = ev["cores"]["a"]["reachable_felling_years"]
+    inferred_b = ev["cores"]["b"]["reachable_felling_years"]
+    assert inferred_a and inferred_b and not (
+        set(inferred_a) & set(inferred_b)), ev
+    print("  [ok] 残失无解：A 推定 "
+          f"{inferred_a}，B 推定 {inferred_b}，无共同砍伐年")
+
+    # 8) 残失字段不完整 / 区间倒置：定位明确的 422
+    bad = case_unique()
+    bad["terminal_loss"] = {"a": {"min": 0, "max": 1}}
+    code, r = post(base, "/api/dendro/align", bad)
+    assert code == 422, r
+    assert r["status"] == "validation_error", r
+    assert any("terminal_loss" in str(e.get("loc", "")) for e in r["errors"])
+    print("  [ok] terminal_loss 单侧缺失返回 422")
+
+    bad = case_unique()
+    bad["terminal_loss"] = {"a": {"min": 2, "max": 1},
+                            "b": {"min": 0, "max": 1}}
+    code, r = post(base, "/api/dendro/align", bad)
+    assert code == 422, r
+    assert any("倒置" in e.get("msg", "") for e in r["errors"]), r
+    print("  [ok] terminal_loss 区间倒置返回 422")
 
     print("\n冒烟全部通过。")
     return 0

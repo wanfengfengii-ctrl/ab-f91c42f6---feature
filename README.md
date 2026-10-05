@@ -24,6 +24,24 @@
 - 缺环、伪环各不超过该支给定限额（0–3）；
 - 所有匹配差值不得越过逐环容差。
 
+### 表层残失环（terminal_loss）
+
+文物梁材表层常因刨削损失少量边材环：两支树芯的末个可见环可能不在同一年。
+可选字段 `terminal_loss` 为 A、B 两芯分别给出残失环数的**闭区间**
+（取值 0–3），启用时两侧配置必须**同时完整提供**：
+
+- 每支末环仍须真实匹配年表（实际末环年 `end_year`）；
+- 共同砍伐年 = 实际末环年 + 选定残失环数，两芯必须落到**同一砍伐年**；
+- 残失环**不计入**缺环、伪环，也不进入原三级优化目标；
+- 不同 `(砍伐年, A 残失, B 残失, 映射)` 都是不同解释，全部同优解释继续
+  参与唯一 / 歧义判定，前两份见证按**砍伐年、两芯残失数、原映射序**
+  稳定排列；
+- 成功响应的 `common_end_year` 表示**共同砍伐年**，各芯映射保留实际末环
+  年份（`end_year`）并返回 `outer_loss`；
+- 未提供该字段时请求、响应、裁决与无解语义与旧版完全一致（响应不含
+  `outer_loss`）。
+
+
 优化目标按字典序：
 
 1. 两芯缺环与伪环**总数**最小；
@@ -57,9 +75,13 @@
   "max_missing_a": 3,
   "max_false_a": 3,
   "max_missing_b": 3,
-  "max_false_b": 3
+  "max_false_b": 3,
+  "terminal_loss": {"a": {"min": 0, "max": 2}, "b": {"min": 1, "max": 3}}
 }
 ```
+
+`terminal_loss` 可省略；启用时 `a`、`b` 两侧必须同时给出 `min`/`max`
+（0–3 整数，且 `min ≤ max`），否则返回定位到具体字段的 422 校验错误。
 
 ## 响应
 
@@ -80,15 +102,19 @@
       "false_sample_rings": [],
       "missing_count": 1, "false_count": 0, "match_count": 10,
       "end_year": 2009,
-      "max_difference": 0, "difference_sum": 0
+      "max_difference": 0, "difference_sum": 0,
+      "outer_loss": 0
     },
     "b": { }
   },
   "objectives": {"total_skips": 1, "max_difference": 0, "difference_sum": 0},
-  "witnesses": [ /* 按映射序稳定的前两份同优见证 */ ],
+  "witnesses": [ /* 启用 terminal_loss 时按砍伐年、残失数、映射序稳定排列 */ ],
   "evidence": null
 }
 ```
+
+`outer_loss` 仅在启用 `terminal_loss` 时出现；此时 `common_end_year` 为
+共同砍伐年，且每个见证都满足 `end_year + outer_loss = common_end_year`。
 
 无解（HTTP 200，业务状态 `no_solution`）：
 
@@ -100,10 +126,15 @@
   "objectives": null,
   "witnesses": [],
   "evidence": {
-    "reason": "last_ring_unmatchable | insufficient_matchable_rings | skip_limits_exceeded | no_common_end_year | common_end_requires_more_skips",
+    "reason": "last_ring_unmatchable | insufficient_matchable_rings | skip_limits_exceeded | no_common_end_year | common_end_requires_more_skips | no_common_felling_year",
     "shared_candidate_years": [],
     "cores": {
-      "a": { "feasible_within_limits": false, "...": "两支各自的终年候选、限额内外最少跳环数等" },
+      "a": {
+        "feasible_within_limits": false,
+        "reachable_felling_years": [],
+        "terminal_loss": {"min": 0, "max": 3},
+        "...": "两支各自的终年 / 砍伐年候选、限额内外最少跳环数等"
+      },
       "b": { }
     },
     "shared_end_details": [ ]
@@ -131,7 +162,8 @@ curl http://localhost:9090/health
 
 1. 代码测试（pytest）；
 2. 应用构建检查（字节码编译、应用导入、健康探测）；
-3. 两芯联合对齐 API 冒烟（唯一解 / 歧义 / 422 校验错误 / 无解证据）。
+3. 两芯联合对齐 API 冒烟（唯一解 / 歧义 / 422 校验错误 / 无解证据，
+   并含无 `terminal_loss` 的兼容调用与残失校准 / 残失无解 / 字段校验）。
 
 并以自身退出码报告成败：
 
