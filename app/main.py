@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -29,6 +29,31 @@ def _sanitize_errors(errors: list[dict]) -> list[dict]:
     return clean
 
 
+class TerminalLossSide(BaseModel):
+    """单支树芯的边材残失环数闭区间（0–3）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    min: int = Field(..., ge=0, le=3, description="残失环数下限 0–3。")
+    max: int = Field(..., ge=0, le=3, description="残失环数上限 0–3。")
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "TerminalLossSide":
+        if self.min > self.max:
+            raise ValueError(
+                f"残失环数区间倒置：min={self.min} 不得大于 max={self.max}")
+        return self
+
+
+class TerminalLoss(BaseModel):
+    """两芯边材残失配置；启用时 a、b 两侧必须同时完整提供。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    a: TerminalLossSide = Field(..., description="A 芯残失环数闭区间。")
+    b: TerminalLossSide = Field(..., description="B 芯残失环数闭区间。")
+
+
 class AlignRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -48,6 +73,10 @@ class AlignRequest(BaseModel):
     max_false_a: int = Field(..., ge=0, le=3, description="A 芯伪环限额 0–3。")
     max_missing_b: int = Field(..., ge=0, le=3, description="B 芯缺环限额 0–3。")
     max_false_b: int = Field(..., ge=0, le=3, description="B 芯伪环限额 0–3。")
+    terminal_loss: Optional[TerminalLoss] = Field(
+        default=None,
+        description="可选：两芯边材残失环数闭区间（各 0–3）；启用时 a、b "
+                    "两侧必须同时完整提供，末环匹配年加残失数须得同一砍伐年。")
 
     @field_validator("chronology")
     @classmethod
@@ -85,6 +114,8 @@ app = FastAPI(
     description=(
         "将同一根梁材的两支树芯共同对入地区年表：先最小化两芯缺环与伪环"
         "总数，再依次最小化最大差值与差值总和，并对同优映射判定唯一 / 歧义。"
+        "可选 terminal_loss 为两芯给出边材残失环数区间，"
+        "以共同砍伐年（末环匹配年 + 残失数）对齐。"
     ),
 )
 

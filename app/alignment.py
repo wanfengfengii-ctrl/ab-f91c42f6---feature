@@ -25,6 +25,14 @@
        指标值与映射数量无关，剪枝不影响最优值）；
     B. 固定最优目标后，用记忆化 DFS 按映射序精确枚举前两份同优见证，
        因此“唯一 / 歧义”的判定是精确的。
+
+残失校准（可选）：请求可附带 terminal_loss，为两芯分别给出 0–3 的
+边材残失环数闭区间。启用后联合条件改为“各芯末环匹配年 + 选定残失数
+= 同一砍伐年”；残失环不计入缺环、伪环与原三级目标，所有同优解释
+（含同一对映射的不同砍伐年取值）都参与唯一性判定，见证按
+（砍伐年, A 残失数, B 残失数, 映射序）稳定排列。成功响应中
+common_end_year 表示共同砍伐年，各芯映射保留实际末环年份并附
+outer_loss。未提供该字段时，请求、响应、裁决与无解语义与原先一致。
 """
 
 from __future__ import annotations
@@ -178,15 +186,16 @@ class _Enumerator:
         """从“下一对样芯下标 >= i、年表下标 >= j”出发能否合法收尾。"""
         if sk_left < 0 or i > self.n - 1 or j > self.end:
             return False
+        # 直接收尾：末环匹配 end，最后间隙的样芯环即伪环、年表项即缺环。
+        # 剩余跳环数恰等于直接收尾所需时，这是唯一的收尾方式。
+        if sk_left == (self.n - 1 - i) + (self.end - j):
+            d = abs(self.s[self.n - 1] - self.c[self.end])
+            return (d <= self.t[self.n - 1] and d <= self.M
+                    and (dsum_left is None or d == dsum_left))
+        if i == self.n - 1:
+            return False
         rings_left = self.n - i
         span = self.end - j
-        if i == self.n - 1:
-            # 末环必须直接匹配 end。
-            if sk_left != 0 or j != self.end:
-                return False
-            d = abs(self.s[i] - self.c[j])
-            return d <= self.t[i] and d <= self.M and (
-                dsum_left is None or d == dsum_left)
         # 剩余 f 个伪环、x 个缺环且 f+x=sk_left：
         # f ≤ rings_left-1（至少末环要匹配）、x ≤ span（至少一个年表槽匹配），
         # 有解当且仅当 span ≥ sk_left-(rings_left-1)。
@@ -215,18 +224,23 @@ class _Enumerator:
 
     def dfs_yield(self, i, j, sk_left, dsum_left, pairs, missing, false):
         """按映射序惰性产出；dsum_left 给定时只产出差值和恰为目标值的映射。"""
-        if i == self.n - 1:
-            d = abs(self.s[i] - self.c[j])
-            if (j == self.end and sk_left == 0 and d <= self.t[i]
-                    and d <= self.M
+        # 直接收尾：末环匹配 end，最后间隙的样芯环即伪环、年表项即缺环。
+        # 剩余跳环数恰等于直接收尾所需时，这是唯一的收尾方式。
+        if sk_left == (self.n - 1 - i) + (self.end - j):
+            d = abs(self.s[self.n - 1] - self.c[self.end])
+            if (d <= self.t[self.n - 1] and d <= self.M
                     and (dsum_left is None or d == dsum_left)):
-                pairs.append((i, j, d))
-                mp = Mapping(tuple(pairs), tuple(sorted(missing)),
-                             tuple(sorted(false)))
+                pairs.append((self.n - 1, self.end, d))
+                mp = Mapping(
+                    tuple(pairs),
+                    tuple(sorted(missing + list(range(j, self.end)))),
+                    tuple(sorted(false + list(range(i, self.n - 1)))))
                 if (mp.miss <= self.miss_cap and mp.fls <= self.false_cap
                         and len(pairs) >= 8):
                     yield mp
                 pairs.pop()
+            return
+        if i == self.n - 1:
             return
         max_ip = min(self.n - 2, i + sk_left)
         for ip in range(i, max_ip + 1):
@@ -323,6 +337,47 @@ def _joint_objective(fa: dict[int, list[_Rec]],
             "ends": sorted(best_ends), "ka": ka, "kb": kb}
 
 
+def _joint_objective_loss(fa: dict[int, list[_Rec]],
+                          fb: dict[int, list[_Rec]],
+                          loss_a: tuple[int, int],
+                          loss_b: tuple[int, int]) -> Optional[dict[str, Any]]:
+    """残失校准下的联合最优：候选为可推出同一砍伐年的终年对 (e_a, e_b)。
+
+    终年对可行当且仅当区间 [e_a+lo_a, e_a+hi_a] 与 [e_b+lo_b, e_b+hi_b]
+    相交，交集中的每个值都是一个可行的砍伐年（年表下标）。残失环不计入
+    目标，三级目标仅由两芯映射本身决定。
+    """
+    ka, kb = _min_skips(fa), _min_skips(fb)
+    lo_a, hi_a = loss_a
+    lo_b, hi_b = loss_b
+    pairs: list[tuple[int, int, int, int]] = []
+    for ea in ka:
+        for eb in kb:
+            f_lo = max(ea + lo_a, eb + lo_b)
+            f_hi = min(ea + hi_a, eb + hi_b)
+            if f_lo <= f_hi:
+                pairs.append((ea, eb, f_lo, f_hi))
+    if not pairs:
+        return None
+    s_total = min(ka[ea] + kb[eb] for ea, eb, _, _ in pairs)
+    pairs = [p for p in pairs if ka[p[0]] + kb[p[1]] == s_total]
+
+    per_pair: dict[tuple[int, int, int, int], tuple[int, int]] = {}
+    for ea, eb, f_lo, f_hi in pairs:
+        pa = [r for r in fa[ea] if r.miss + r.fls == ka[ea]]
+        pb = [r for r in fb[eb] if r.miss + r.fls == kb[eb]]
+        m_e = max(min(r.mmax for r in pa), min(r.mmax for r in pb))
+        # 联合最大差值恰为 m_e 时，两侧差值和各自可取的最小值。
+        d_a = min(r.dsum for r in pa if r.mmax <= m_e)
+        d_b = min(r.dsum for r in pb if r.mmax <= m_e)
+        per_pair[(ea, eb, f_lo, f_hi)] = (m_e, d_a + d_b)
+    mstar = min(v[0] for v in per_pair.values())
+    sstar = min(v[1] for v in per_pair.values() if v[0] == mstar)
+    best = sorted(p for p, v in per_pair.items() if v == (mstar, sstar))
+    return {"skips": s_total, "mmax": mstar, "dsum": sstar,
+            "pairs": best, "ka": ka, "kb": kb}
+
+
 def _enumerate_core(sample, chron, tol, end, skips, mstar, miss_cap, false_cap,
                     dsum_target, limit) -> list[Mapping]:
     return _enumerate_simple(sample, chron, tol, end, skips, mstar,
@@ -364,13 +419,61 @@ def find_witnesses(sa, sb, chron, ta, tb, fa, fb,
     return pool[:2]
 
 
+def _mapping_pairs(sa, sb, chron, ta, tb, ea, eb, skips_a, skips_b,
+                   mstar, sstar, miss_caps, false_caps, limit):
+    """固定两芯终年后，按映射序产出前 limit 份同优映射对 (ma, mb)。"""
+    out: list[tuple[Mapping, Mapping]] = []
+    b_cache: dict[int, list[Mapping]] = {}
+    for ma in _enumerate_core(sa, chron, ta, ea, skips_a, mstar,
+                              miss_caps[0], false_caps[0], None, None):
+        need = sstar - ma.dsum
+        if need not in b_cache:
+            b_cache[need] = list(_enumerate_core(
+                sb, chron, tb, eb, skips_b, mstar,
+                miss_caps[1], false_caps[1], need, 2))
+        for mb in b_cache[need]:
+            out.append((ma, mb))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def find_witnesses_loss(sa, sb, chron, ta, tb,
+                        miss_caps, false_caps, opt) -> list:
+    """残失校准下跨所有最优终年对取前两份联合见证。
+
+    每份见证为 (砍伐年下标, A 残失数, B 残失数, A 映射, B 映射)。
+    同一终年对内砍伐年递增、同年按映射序；全局按
+    （砍伐年, A 残失数, B 残失数, 映射序）归并取前两份，
+    因此“唯一 / 歧义”判定精确覆盖全部同优解释。
+    """
+    mstar, sstar = opt["mmax"], opt["dsum"]
+    pool: list[tuple[int, int, int, Mapping, Mapping]] = []
+    for ea, eb, f_lo, f_hi in opt["pairs"]:
+        mps = _mapping_pairs(sa, sb, chron, ta, tb, ea, eb,
+                             opt["ka"][ea], opt["kb"][eb], mstar, sstar,
+                             miss_caps, false_caps, 2)
+        found: list[tuple[int, int, int, Mapping, Mapping]] = []
+        for f in range(f_lo, f_hi + 1):
+            for ma, mb in mps:
+                found.append((f, f - ea, f - eb, ma, mb))
+                if len(found) == 2:
+                    break
+            if len(found) == 2:
+                break
+        pool.extend(found)
+    pool.sort(key=lambda t: (t[0], t[1], t[2], t[3].sig, t[4].sig))
+    return pool[:2]
+
+
 # --------------------------------------------------------------------------- #
 # 响应组装
 # --------------------------------------------------------------------------- #
 
 def _mapping_payload(mp: Mapping, start_year: int, sample: list[int],
-                     chron: list[int]) -> dict[str, Any]:
-    return {
+                     chron: list[int],
+                     outer_loss: Optional[int] = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "matched": [
             {
                 "sample_ring": si + 1,
@@ -392,17 +495,34 @@ def _mapping_payload(mp: Mapping, start_year: int, sample: list[int],
         "max_difference": mp.mmax,
         "difference_sum": mp.dsum,
     }
+    if outer_loss is not None:
+        # 残失校准：末环匹配年之后的边材残失环数。
+        payload["outer_loss"] = outer_loss
+    return payload
 
 
 def _witness_payload(ma: Mapping, mb: Mapping, start_year: int,
                      sa: list[int], sb: list[int],
-                     chron: list[int]) -> dict[str, Any]:
-    e = ma.pairs[-1][1]
+                     chron: list[int],
+                     felling: Optional[int] = None) -> dict[str, Any]:
+    ea = ma.pairs[-1][1]
+    eb = mb.pairs[-1][1]
+    if felling is None:
+        return {
+            "common_end_year": start_year + ea,
+            "mappings": {
+                "a": _mapping_payload(ma, start_year, sa, chron),
+                "b": _mapping_payload(mb, start_year, sb, chron),
+            },
+        }
+    # 残失校准：common_end_year 为共同砍伐年，各芯保留实际末环年份。
     return {
-        "common_end_year": start_year + e,
+        "common_end_year": start_year + felling,
         "mappings": {
-            "a": _mapping_payload(ma, start_year, sa, chron),
-            "b": _mapping_payload(mb, start_year, sb, chron),
+            "a": _mapping_payload(ma, start_year, sa, chron,
+                                  outer_loss=felling - ea),
+            "b": _mapping_payload(mb, start_year, sb, chron,
+                                  outer_loss=felling - eb),
         },
     }
 
@@ -428,7 +548,7 @@ def _best_by_end(front: dict[int, list[_Rec]]) -> dict[int, _Rec]:
 
 
 def _no_solution_payload(start_year, chron, sa, sb, ta, tb,
-                         caps, fa, fb) -> dict[str, Any]:
+                         caps, fa, fb, loss=None) -> dict[str, Any]:
     (miss_a, false_a), (miss_b, false_b) = caps
     n = (len(sa), len(sb))
     m = len(chron)
@@ -441,7 +561,16 @@ def _no_solution_payload(start_year, chron, sa, sb, ta, tb,
     last_a = [j for j in range(m) if abs(sa[-1] - chron[j]) <= ta[-1]]
     last_b = [j for j in range(m) if abs(sb[-1] - chron[j]) <= tb[-1]]
 
-    shared_relaxed = sorted(set(rel1_a) & set(rel1_b))
+    if loss is None:
+        shared_relaxed = sorted(set(rel1_a) & set(rel1_b))
+    else:
+        # 残失校准下，共同候选是“末环年 + 残失数”可达的砍伐年下标。
+        shared_relaxed = sorted(
+            {e + d for e in rel1_a
+             for d in range(loss[0][0], loss[0][1] + 1)}
+            & {e + d for e in rel1_b
+               for d in range(loss[1][0], loss[1][1] + 1)}
+        )
 
     if k1_a is None or k1_b is None:
         reason = "last_ring_unmatchable"
@@ -454,8 +583,9 @@ def _no_solution_payload(start_year, chron, sa, sb, ta, tb,
     else:
         reason = "common_end_requires_more_skips"
 
-    def core_ev(rel8, rel1, k8, last, strict, miss_cap, false_cap, nn):
-        return {
+    def core_ev(rel8, rel1, k8, last, strict, miss_cap, false_cap, nn,
+                loss_bounds=None):
+        ev: dict[str, Any] = {
             "feasible_within_limits": bool(strict),
             "last_ring_candidate_years": [start_year + j for j in last],
             "reachable_end_years_within_limits": [
@@ -472,9 +602,21 @@ def _no_solution_payload(start_year, chron, sa, sb, ta, tb,
             ),
             "limits": {"missing": miss_cap, "false": false_cap},
         }
+        if loss_bounds is not None:
+            lo, hi = loss_bounds
+            # 该芯在限额内可达末环年 + 残失区间推出的全部砍伐年。
+            ev["reachable_felling_years_within_limits"] = sorted(
+                {start_year + e + d for e in strict
+                 for d in range(lo, hi + 1)})
+            ev["limits"]["outer_loss"] = {"min": lo, "max": hi}
+        return ev
 
-    ev_a = core_ev(rel8_a, rel1_a, k8_a, last_a, fa, miss_a, false_a, n[0])
-    ev_b = core_ev(rel8_b, rel1_b, k8_b, last_b, fb, miss_b, false_b, n[1])
+    loss_a = loss[0] if loss is not None else None
+    loss_b = loss[1] if loss is not None else None
+    ev_a = core_ev(rel8_a, rel1_a, k8_a, last_a, fa, miss_a, false_a,
+                   n[0], loss_a)
+    ev_b = core_ev(rel8_b, rel1_b, k8_b, last_b, fb, miss_b, false_b,
+                   n[1], loss_b)
 
     best8 = (_best_by_end(rel8_a), _best_by_end(rel8_b))
     best1 = (_best_by_end(rel1_a), _best_by_end(rel1_b))
@@ -486,11 +628,42 @@ def _no_solution_payload(start_year, chron, sa, sb, ta, tb,
         for idx, (miss_cap, false_cap) in enumerate(
             ((miss_a, false_a), (miss_b, false_b))
         ):
-            r = best8[idx].get(j) or best1[idx].get(j)
-            if r is None:
-                entry["ab"[idx]] = None
+            key = "ab"[idx]
+            if loss is None:
+                r = best8[idx].get(j) or best1[idx].get(j)
+                rec: Optional[dict[str, Any]] = None
+                if r is not None:
+                    rec = {
+                        "missing": r.miss,
+                        "false": r.fls,
+                        "total_skips": r.miss + r.fls,
+                        "match_count": n[idx] - r.fls,
+                        "max_difference": r.mmax,
+                        "difference_sum": r.dsum,
+                        "within_limits": (
+                            r.miss <= miss_cap and r.fls <= false_cap
+                            and n[idx] - r.fls >= 8
+                        ),
+                    }
+                entry[key] = rec
                 continue
-            entry["ab"[idx]] = {
+            # 残失校准：该砍伐年可经多个 (末环, 残失数) 组合达到，
+            # 取最优记录（优先 8 环匹配档，再按跳环 / 差值 / 残失数）。
+            lo, hi = loss[idx]
+            cands = []
+            for d in range(lo, hi + 1):
+                e = j - d
+                for tier, pool in ((0, best8[idx]), (1, best1[idx])):
+                    r = pool.get(e)
+                    if r is not None:
+                        cands.append((tier, r.miss + r.fls, r.mmax,
+                                      r.dsum, d, e, r))
+            if not cands:
+                entry[key] = None
+                continue
+            cands.sort(key=lambda t: t[:6])
+            _, _, _, _, d, e, r = cands[0]
+            entry[key] = {
                 "missing": r.miss,
                 "false": r.fls,
                 "total_skips": r.miss + r.fls,
@@ -501,6 +674,8 @@ def _no_solution_payload(start_year, chron, sa, sb, ta, tb,
                     r.miss <= miss_cap and r.fls <= false_cap
                     and n[idx] - r.fls >= 8
                 ),
+                "end_year": start_year + e,
+                "outer_loss": d,
             }
         shared_details.append(entry)
 
@@ -532,26 +707,63 @@ def align_joint(payload: dict[str, Any]) -> dict[str, Any]:
     miss_b, false_b = payload["max_missing_b"], payload["max_false_b"]
     caps = ((miss_a, false_a), (miss_b, false_b))
 
+    tl = payload.get("terminal_loss")
+    loss: Optional[tuple[tuple[int, int], tuple[int, int]]] = None
+    if tl is not None:
+        loss = ((tl["a"]["min"], tl["a"]["max"]),
+                (tl["b"]["min"], tl["b"]["max"]))
+
     fa = core_front(sa, chron, ta, miss_a, false_a, 8)
     fb = core_front(sb, chron, tb, miss_b, false_b, 8)
 
-    opt = _joint_objective(fa, fb)
+    if loss is None:
+        opt = _joint_objective(fa, fb)
+        if opt is None:
+            return _no_solution_payload(start_year, chron, sa, sb, ta, tb,
+                                        caps, fa, fb)
+        witnesses = find_witnesses(
+            sa, sb, chron, ta, tb, fa, fb,
+            (miss_a, miss_b), (false_a, false_b), opt,
+        )
+        if not witnesses:
+            # 理论不可达（最优值必有映射支撑），保守按无解处理。
+            return _no_solution_payload(start_year, chron, sa, sb, ta, tb,
+                                        caps, fa, fb)
+        ma0, mb0 = witnesses[0]
+        status = "unique" if len(witnesses) == 1 else "ambiguous"
+        primary = _witness_payload(ma0, mb0, start_year, sa, sb, chron)
+        return {
+            "status": status,
+            "common_end_year": primary["common_end_year"],
+            "mappings": primary["mappings"],
+            "objectives": {
+                "total_skips": opt["skips"],
+                "max_difference": opt["mmax"],
+                "difference_sum": opt["dsum"],
+            },
+            "witnesses": [
+                _witness_payload(ma, mb, start_year, sa, sb, chron)
+                for ma, mb in witnesses
+            ],
+            "evidence": None,
+        }
+
+    opt = _joint_objective_loss(fa, fb, loss[0], loss[1])
     if opt is None:
         return _no_solution_payload(start_year, chron, sa, sb, ta, tb,
-                                    caps, fa, fb)
-
-    witnesses = find_witnesses(
-        sa, sb, chron, ta, tb, fa, fb,
+                                    caps, fa, fb, loss=loss)
+    witnesses = find_witnesses_loss(
+        sa, sb, chron, ta, tb,
         (miss_a, miss_b), (false_a, false_b), opt,
     )
     if not witnesses:
         # 理论不可达（最优值必有映射支撑），保守按无解处理。
         return _no_solution_payload(start_year, chron, sa, sb, ta, tb,
-                                    caps, fa, fb)
-
-    ma0, mb0 = witnesses[0]
+                                    caps, fa, fb, loss=loss)
+    f0, _, _, ma0, mb0 = witnesses[0]
     status = "unique" if len(witnesses) == 1 else "ambiguous"
-    primary = _witness_payload(ma0, mb0, start_year, sa, sb, chron)
+    primary = _witness_payload(ma0, mb0, start_year, sa, sb, chron,
+                               felling=f0)
     return {
         "status": status,
         "common_end_year": primary["common_end_year"],
@@ -562,8 +774,8 @@ def align_joint(payload: dict[str, Any]) -> dict[str, Any]:
             "difference_sum": opt["dsum"],
         },
         "witnesses": [
-            _witness_payload(ma, mb, start_year, sa, sb, chron)
-            for ma, mb in witnesses
+            _witness_payload(ma, mb, start_year, sa, sb, chron, felling=f)
+            for f, _, _, ma, mb in witnesses
         ],
         "evidence": None,
     }
